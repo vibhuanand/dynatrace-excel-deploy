@@ -1,0 +1,128 @@
+- hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    generated_dir: "{{ playbook_dir }}/../.generated"
+    rendered_manifest: "{{ generated_dir }}/manifest.yaml"
+
+  tasks:
+    # 0) Local workspace
+    - name: Ensure .generated exists
+      ansible.builtin.file:
+        path: "{{ generated_dir }}"
+        state: directory
+        mode: "0755"
+
+    # 1) Resolve SSOT (path -> cfg)
+    - name: Show execution context - repo root listing
+      ansible.builtin.command: ls -1
+      args:
+        chdir: "{{ playbook_dir }}/.."
+      register: _ls_root
+      changed_when: false
+
+    - name: Show execution context
+      ansible.builtin.debug:
+        msg:
+          - "playbook_dir={{ playbook_dir }}"
+          - "repo_root={{ playbook_dir }}/.."
+          - "repo_root_items={{ _ls_root.stdout_lines }}"
+
+    - name: Choose incoming SSOT path (pipeline gives ssot_file; legacy env_file)
+      ansible.builtin.set_fact:
+        _ssot_src: "{{ ssot_file | default(env_file, true) | default('', true) | trim }}"
+
+    - name: Fail if no SSOT path provided
+      ansible.builtin.fail:
+        msg: "No ssot_file/env_file provided to playbook."
+      when: _ssot_src | length == 0
+
+    - name: Resolve SSOT absolute path (trim + single-line)
+      ansible.builtin.set_fact:
+        ssot_abs: "{{ (_ssot_src if (_ssot_src is match('^/|^[A-Za-z]:')) else (playbook_dir ~ '/../' ~ _ssot_src)) | trim }}"
+
+    - name: Check SSOT file exists
+      ansible.builtin.stat:
+        path: "{{ ssot_abs }}"
+      register: _ssot_stat
+
+    - name: Fail if SSOT file not found
+      ansible.builtin.fail:
+        msg: "SSOT file not found at {{ ssot_abs | to_json }}"
+      when: not _ssot_stat.stat.exists
+
+    - name: Load SSOT env YAML
+      ansible.builtin.slurp:
+        src: "{{ ssot_abs }}"
+      register: env_raw
+
+    - name: Parse SSOT → cfg
+      ansible.builtin.set_fact:
+        cfg: "{{ env_raw.content | b64decode | from_yaml }}"
+
+    - name: Show key SSOT fields
+      ansible.builtin.debug:
+        msg:
+          - "cfg.env={{ cfg.env | default('') }}"
+          - "cfg.url={{ cfg.url | default('') }}"
+          - "cfg.token(var name)={{ cfg.token | default('') }}"
+
+    # 2) Token resolution (only if lookup_hosts=true)
+    - name: Resolve token name from SSOT
+      ansible.builtin.set_fact:
+        token_name: "{{ cfg.token | default('') | trim }}"
+
+    - name: Lookup token value from job environment (only when needed)
+      ansible.builtin.set_fact:
+        token_value: "{{ lookup('env', token_name) | default('', true) }}"
+      when:
+        - (lookup_hosts | default(false)) | bool
+        - token_name | length > 0
+
+    - name: Fail if token env var missing (only when needed)
+      ansible.builtin.fail:
+        msg: >
+          Dynatrace token env var '{{ token_name }}' is not available to this job.
+          Define it as a secret pipeline variable with this exact name.
+      when:
+        - (lookup_hosts | default(false)) | bool
+        - token_name | length == 0 or token_value | length == 0
+
+    # 3) Render Monaco manifest
+    - name: Render Monaco manifest (manifest.yaml.j2)
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/templates/manifest.yaml.j2"
+        dest: "{{ rendered_manifest }}"
+        mode: "0644"
+      vars:
+        cfg: "{{ cfg }}"
+        projects:
+          - name: process-availability
+            path: ansible/modules/process-availability
+
+    - name: Show generated manifest (first 200 lines)
+      ansible.builtin.shell: |
+        set -e
+        echo "----- .generated/manifest.yaml -----"
+        sed -n '1,200p' "{{ rendered_manifest }}"
+        echo "------------------------------------"
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    # 4) Compute execution mode
+    - name: Compute execution mode
+      ansible.builtin.set_fact:
+        exec_mode: "{{ run_mode | default('plan') }}"
+
+    # 5) Hand off to component: proc_availability (after cfg is ready)
+    - name: Process availability (Settings 2.0)
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/components/proc_availability/tasks/main.yaml"
+      vars:
+        ssot_file: "{{ ssot_abs }}"
+        ssot_abs: "{{ ssot_abs }}"            # needed by merger
+        environment_name: "{{ environment_name | default(cfg.env | default('')) }}"
+        token: "{{ token_name }}"
+        token_value: "{{ token_value }}"
+        exec_mode: "{{ run_mode | default('plan') }}"

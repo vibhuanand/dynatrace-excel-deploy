@@ -1,0 +1,89 @@
+---
+# Reads SSOT and produces:
+#  - .generated/ansible/modules/synthetic-nam/nam.json  (canonical list)
+#  - .generated/ansible/modules/synthetic-nam/config.yaml (for deploy script)
+#  - .generated/ansible/modules/synthetic-nam/payloads/*.json (one per monitor)
+
+- name: Ensure NAM output dirs
+  ansible.builtin.file:
+    path: "{{ playbook_dir }}/../.generated/ansible/modules/synthetic-nam/payloads"
+    state: directory
+    mode: "0755"
+
+- name: Merge NAM inventory (JSON/XLSX → canonical JSON)
+  ansible.builtin.command: >
+    python3 {{ playbook_dir }}/components/synthetic_nam/merge_nam_inventory.py
+    --ssot {{ ssot_file }}
+    --out {{ playbook_dir }}/../.generated/ansible/modules/synthetic-nam/nam.json
+  register: _merge
+  changed_when: false
+
+- name: Load canonical NAM
+  ansible.builtin.slurp:
+    src: "{{ playbook_dir }}/../.generated/ansible/modules/synthetic-nam/nam.json"
+  register: nam_raw
+
+- name: Parse canonical
+  ansible.builtin.set_fact:
+    nam: "{{ nam_raw.content | b64decode | from_json }}"
+
+- name: Write config.yaml for deploy
+  ansible.builtin.copy:
+    dest: "{{ playbook_dir }}/../.generated/ansible/modules/synthetic-nam/config.yaml"
+    mode: "0644"
+    content: |
+      configs:
+      {% for m in nam.monitors %}
+        - id: "{{ m.name | regex_replace('[^A-Za-z0-9_.:-]','_') }}"
+          name: "{{ m.name }}"
+          enabled: {{ m.enabled | default(true) | ternary(true,false) }}
+          frequencyMin: {{ m.frequencyMin | int }}
+          locations: {{ m.locations | to_nice_yaml(indent=10) | trim }}
+          icmp:
+            packets: {{ m.icmp.packets | int }}
+            timeout: "{{ m.icmp.timeout }}"
+            ip_version: "{{ m.icmp.ip_version }}"
+          constraints:
+            step_success_rate: { operator: "{{ m.constraints.step_success_rate.operator }}", value: "{{ m.constraints.step_success_rate.value }}" }
+            per_target_success: { operator: "{{ m.constraints.per_target_success.operator }}", value: "{{ m.constraints.per_target_success.value }}" }
+          targets: {{ m.targets | to_nice_yaml(indent=10) | trim }}
+      {% endfor %}
+
+- name: Emit one payload per monitor
+  ansible.builtin.copy:
+    dest: "{{ playbook_dir }}/../.generated/ansible/modules/synthetic-nam/payloads/{{ item.name | regex_replace('[^A-Za-z0-9_.:-]','_') }}.json"
+    mode: "0644"
+    content: |
+      {
+        "name": "{{ item.name }}",
+        "type": "MULTI_PROTOCOL",
+        "enabled": {{ item.enabled | ternary('true','false') }},
+        "frequencyMin": {{ item.frequencyMin }},
+        "locations": {{ item.locations | to_json }},
+        "steps": [
+          {
+            "name": "ICMP",
+            "requestType": "ICMP",
+            "constraints": [
+              { "type": "SUCCESS_RATE_PERCENT", "properties": { "operator": "{{ item.constraints.step_success_rate.operator }}", "value": "{{ item.constraints.step_success_rate.value }}" } }
+            ],
+            "properties": {
+              "ICMP_NUMBER_OF_PACKETS": {{ item.icmp.packets }},
+              "ICMP_TIMEOUT_FOR_REPLY": "{{ item.icmp.timeout }}",
+              "ICMP_IP_VERSION": "{{ item.icmp.ip_version }}"
+            },
+            "targetList": {{ item.targets | to_json }},
+            "requestConfigurations": [
+              { "constraints": [ { "type":"ICMP_SUCCESS_RATE_PERCENT", "properties": { "operator": "{{ item.constraints.per_target_success.operator }}", "value": "{{ item.constraints.per_target_success.value }}" } } ] }
+            ]
+          }
+        ],
+        "syntheticMonitorOutageHandlingSettings": {
+          "globalOutages": {{ (resources.network_availability.defaults.outage_handling.globalOutages | default(true)) | ternary('true','false') }},
+          "localOutages": {{ (resources.network_availability.defaults.outage_handling.localOutages | default(true)) | ternary('true','false') }},
+          "globalConsecutiveOutageCountThreshold": {{ resources.network_availability.defaults.outage_handling.globalConsecutiveOutageCountThreshold | default(1) }},
+          "localConsecutiveOutageCountThreshold": {{ resources.network_availability.defaults.outage_handling.localConsecutiveOutageCountThreshold | default(3) }}
+        }
+      }
+  loop: "{{ nam.monitors }}"
+  when: (nam.monitors | length) > 0

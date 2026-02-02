@@ -1,0 +1,37 @@
+---
+#envs/cra/prod.yaml
+id: tra
+env: prod
+url: 
+token: DT_TOKEN_CRA_PROD
+
+projects:
+  - name: process-availability
+    path: ansible/modules/process-availability
+
+naming:
+  pattern: "{{ org_alias }}-{{ env_alias }}-{{ module }}-{{ key }}"
+  org_alias: cra
+  env_alias: prod
+  prefix: "bsc"
+
+resources:
+  process_availability:
+    sources:
+      - path: "process-monitoring_1.json"
+        defaults:
+          host_match: contains     
+      - path: "process-monitoring_0.xlsx"
+        defaults:
+          matcher_key: cmd_contains
+          min: 1
+          os: ["LINUX"]
+          host_suffix: ""
+          host_prefix: ""
+          host_match: contains
+          metadata:
+            Event-Category: APP
+            Event-Recipient: n/a
+            # Event-Recipient: SL-EMAIL
+  alerting-profile:
+    sources:

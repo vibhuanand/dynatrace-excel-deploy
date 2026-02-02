@@ -1,0 +1,109 @@
+trigger: none
+pr: none
+
+# --- Select which module to deploy ---
+parameters:
+- name: module
+  displayName: 'Module'
+  type: string
+  default: process-availability
+  values:
+  - process-availability
+  - synthetic-nam   # optional future child; safe to leave here
+
+# --- Common knobs you already use ---
+- name: mission_space
+  displayName: 'Mission Space (Org)'
+  type: string
+  default: cra
+  values: [cra, statscan]
+
+- name: environment
+  displayName: 'Environment'
+  type: string
+  default: prod
+  values: [dev, prod]
+
+- name: run_mode
+  displayName: 'Action'
+  type: string
+  default: plan
+  values: [plan, dry-run, apply]
+
+# These exist in your monaco-deploy.yaml; we’ll pass them through unchanged
+- name: online_agent_pool
+  displayName: 'Deploy agent (self-hosted pool)'
+  type: string
+  default: vibhu_machine
+  values: [vibhu_machine]
+
+- name: project_name
+  displayName: 'Dynatrace project name'
+  type: string
+  default: process-availability
+  values: [process-availability]
+
+variables:
+  # Set these once to your ADO org/project and child pipeline IDs (Pipelines → <pipeline> → ID in URL)
+  ORG: your-ado-org
+  PROJECT: your-ado-project
+  PA_PIPELINE_ID: '<<ID of monaco-deploy.yaml>>'      # existing pipeline, UNCHANGED
+  NAM_PIPELINE_ID: '<<ID of synthetic-nam-deploy>>'   # optional, only if you add NAM child
+
+stages:
+- stage: Dispatch
+  displayName: 'Dispatch to module pipeline'
+  jobs:
+  - job: QueueChild
+    displayName: 'Queue child pipeline via REST'
+    steps:
+    - task: PowerShell@2
+      displayName: 'Queue selected pipeline'
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      inputs:
+        targetType: inline
+        script: |
+          $ErrorActionPreference = 'Stop'
+
+          # map module -> child pipeline id
+          $module = '${{ parameters.module }}'
+          $map = @{
+            'process-availability' = '$(PA_PIPELINE_ID)'
+            'synthetic-nam'        = '$(NAM_PIPELINE_ID)'
+          }
+          if (-not $map.ContainsKey($module)) { throw "Unknown module: $module" }
+          $pid = $map[$module]
+
+          $org = '$(ORG)'
+          $proj = '$(PROJECT)'
+          $url = "https://dev.azure.com/$org/$proj/_apis/pipelines/$pid/runs?api-version=7.1-preview.1"
+
+          # Pass exactly what monaco-deploy.yaml expects (no edits needed there)
+          $body = @{
+            resources = @{
+              repositories = @{
+                self = @{ refName = "$(Build.SourceBranch)" }   # run child on same branch
+              }
+            }
+            templateParameters = @{
+              mission_space    = '${{ parameters.mission_space }}'
+              environment      = '${{ parameters.environment }}'
+              run_mode         = '${{ parameters.run_mode }}'
+              online_agent_pool= '${{ parameters.online_agent_pool }}'
+              project_name     = '${{ parameters.project_name }}'
+            }
+            variables = @{
+              # forward tokens as secrets (names match what the child expects)
+              DT_TOKEN_CRA_PROD = @{ value = "$(DT_TOKEN_CRA_PROD)"; isSecret = $true }
+            }
+          } | ConvertTo-Json -Depth 10
+
+          $headers = @{ Authorization = "Bearer $(System.AccessToken)"; "Content-Type"="application/json" }
+          Write-Host "POST $url"
+          $resp = Invoke-RestMethod -Uri $url -Method Post -Headers $headers -Body $body
+          Write-Host "Queued pipeline run id=$($resp.id) state=$($resp.state)"
+
+# Pipeline setting required on the orchestrator:
+#  - Enable "Allow scripts to access the OAuth token" (for $(System.AccessToken))
+# Also ensure the orchestrator pipeline has permission to "Run pipeline" on the child pipelines.

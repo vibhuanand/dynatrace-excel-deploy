@@ -1,0 +1,11 @@
+configs:
+{% for av in avail_instances %}
+  - id: {{ av.id }}
+    config:
+      name: "{{ av.displayName }}"
+      template: "payloads/{{ av.id }}.json"
+    type:
+      settings:
+        schema: "builtin:processavailability"
+        scope: "HOST-PLACEHOLDER"
+{% endfor %}

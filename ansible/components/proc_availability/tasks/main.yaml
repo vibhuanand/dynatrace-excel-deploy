@@ -1,0 +1,448 @@
+# NOTE: Plain list of tasks (no '---' or '...' document markers).
+
+# ---------------------------
+# 0) Load inputs + normalize
+# ---------------------------
+
+# NEVER read generated_dir to compute itself; use a separate override var.
+- name: Compute generated_dir (no self-reference)
+  ansible.builtin.set_fact:
+    generated_dir: >-
+      {%- set raw = (generated_dir_override | default('', true) | string | trim) -%}
+      {%- if raw == '' -%}
+        {{ playbook_dir ~ '/../.generated' }}
+      {%- elif raw is match('^/|^[A-Za-z]:') -%}
+        {{ raw }}
+      {%- else -%}
+        {{ playbook_dir ~ '/../' ~ raw }}
+      {%- endif -%}
+
+- name: Ensure .generated exists
+  ansible.builtin.file:
+    path: "{{ generated_dir }}"
+    state: directory
+    mode: "0755"
+
+# Resolve SSOT path (so we can include vars like naming/url/token)
+- name: Resolve SSOT raw path
+  ansible.builtin.set_fact:
+    _ssot_file_raw: >-
+      {{ ssot_file
+         | default(lookup('env','SSOT_FILE'), true)
+         | default('envs/cra/prod.yaml', true) | trim }}
+
+- name: Resolve absolute SSOT path
+  ansible.builtin.set_fact:
+    _ssot_file_abs: >-
+      {% if _ssot_file_raw is match('^/|^[A-Za-z]:') -%}
+        {{ _ssot_file_raw }}
+      {%- else -%}
+        {{ playbook_dir ~ '/../' ~ _ssot_file_raw }}
+      {%- endif %}
+
+- name: Show resolved SSOT path
+  ansible.builtin.debug:
+    msg:
+      - "ssot_file(raw)={{ _ssot_file_raw }}"
+      - "ssot_file(abs)={{ _ssot_file_abs }}"
+
+- name: Check SSOT file exists
+  ansible.builtin.stat:
+    path: "{{ _ssot_file_abs }}"
+  register: _ssot_stat
+
+- name: Fail if SSOT file not found
+  ansible.builtin.fail:
+    msg: "SSOT file not found at {{ _ssot_file_abs }}"
+  when: not _ssot_stat.stat.exists
+
+- name: Load SSOT vars
+  ansible.builtin.include_vars:
+    file: "{{ _ssot_file_abs }}"
+
+# Build one canonical inventory from per-file sources (JSON + Excel)
+- name: Point to merge_inventory.py (under ansible/components/scripts)
+  ansible.builtin.set_fact:
+    merge_inventory_py: "{{ playbook_dir }}/components/scripts/merge_inventory.py"
+
+- name: Verify merge_inventory.py exists
+  ansible.builtin.stat:
+    path: "{{ merge_inventory_py }}"
+  register: _merge_stat
+
+- name: Fail if merge_inventory.py is missing
+  ansible.builtin.fail:
+    msg: "merge_inventory.py not found at {{ merge_inventory_py }}"
+  when: not _merge_stat.stat.exists
+
+- name: Merge inventory sources (JSON + Excel) -> canonical JSON
+  ansible.builtin.command: >
+    {{ ansible_playbook_python }} "{{ merge_inventory_py }}"
+    --ssot "{{ _ssot_file_abs }}"
+    --out "{{ generated_dir }}/inventory_combined.json"
+  register: _merge_inventory
+  changed_when: true
+
+- name: Inventory merge summary
+  ansible.builtin.debug:
+    msg: "{{ (_merge_inventory.stderr_lines | default([])) + (_merge_inventory.stdout_lines | default([])) }}"
+
+- name: Choose inventory file (merged)
+  ansible.builtin.set_fact:
+    process_inventory_file: "{{ generated_dir }}/inventory_combined.json"
+
+# ---------------------------
+# 1) Prepare local workspace
+# ---------------------------
+
+- name: Ensure .generated exists (for manifest and logs)
+  ansible.builtin.file:
+    path: "{{ generated_dir }}"
+    state: directory
+    mode: "0755"
+
+# Monaco project paths (we will render payloads/config INSIDE this project)
+- name: Set Monaco project path (relative & absolute)
+  ansible.builtin.set_fact:
+    monaco_project_rel: "ansible/modules/process-availability"
+    monaco_project_abs: "{{ playbook_dir }}/modules/process-availability"
+    payloads_dir: "{{ playbook_dir }}/modules/process-availability/payloads"
+
+- name: Clean payloads dir (remove old .jsons from previous runs)
+  ansible.builtin.file:
+    path: "{{ payloads_dir }}"
+    state: absent
+
+- name: Recreate project payloads folder
+  ansible.builtin.file:
+    path: "{{ payloads_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Ensure Monaco project folder exists
+  ansible.builtin.stat:
+    path: "{{ monaco_project_abs }}"
+  register: _monaco_proj
+
+- name: Fail if Monaco project folder is missing
+  ansible.builtin.fail:
+    msg: "Monaco project folder not found at {{ monaco_project_abs }}. Check your repo layout."
+  when: not _monaco_proj.stat.exists
+
+- name: Show SSOT context
+  ansible.builtin.debug:
+    msg:
+      - "resources={{ resources | default({}) }}"
+      - "naming={{ naming | default({}) }}"
+
+# ------------------------------------------
+# 2) Load & parse the merged inventory JSON
+# ------------------------------------------
+
+- name: Ensure merged inventory exists
+  ansible.builtin.stat:
+    path: "{{ process_inventory_file }}"
+  register: _merged_inv_stat
+
+- name: Fail if merged inventory missing
+  ansible.builtin.fail:
+    msg: "Merged inventory not found at {{ process_inventory_file }}"
+  when: not _merged_inv_stat.stat.exists
+
+- name: Load merged inventory JSON (base64)
+  ansible.builtin.slurp:
+    src: "{{ process_inventory_file }}"
+  register: inv_raw
+
+- name: Preview inventory content
+  ansible.builtin.set_fact:
+    inv_bytes: "{{ (inv_raw.content | b64decode) | length }}"
+    inv_head:  "{{ (inv_raw.content | b64decode)[0:120] | default('') }}"
+
+- name: Show inventory bytes + head
+  ansible.builtin.debug:
+    msg:
+      - "inventory_bytes={{ inv_bytes }}"
+      - "inventory_head={{ inv_head }}"
+
+- name: Make clean inventory text
+  ansible.builtin.set_fact:
+    inv_text: >-
+      {% set t = (inv_raw.content | b64decode | regex_replace('^\uFEFF', '')) %}
+      {% if t | regex_search('^\\.\\.\\.[\\r\\n\\s]*\\{') %}
+      {{ (t | regex_replace('^\\.\\.\\.[\\r\\n\\s]*', '')) | trim }}
+      {% else %}
+      {{ t | trim }}
+      {% endif %}
+
+- name: Fail if inventory empty
+  ansible.builtin.fail:
+    msg: "Inventory file {{ process_inventory_file }} is empty or unreadable (bytes={{ inv_bytes }}, head={{ inv_head }})"
+  when: inv_text | length == 0
+
+- name: Parse inventory JSON
+  ansible.builtin.set_fact:
+    inv: "{{ inv_text | from_json }}"
+  failed_when: inv is not defined
+
+- name: Extract inventory fields
+  ansible.builtin.set_fact:
+    inv_defaults: "{{ inv.defaults | default({}) }}"
+    inv_hosts: "{{ inv.hosts | default([]) }}"
+    name_suffix: "{{ inv.nameSuffix | default('') }}"
+    name_prefix_from_inv: "{{ inv.namePrefix | default('') }}"
+
+- name: Validate JSON structure (keys exist)
+  ansible.builtin.assert:
+    that:
+      - inv is mapping
+      - inv_hosts is iterable
+    fail_msg: "Inventory JSON looks invalid. head={{ inv_text[0:200] | default('') }}"
+
+# -----------------------------------------------------
+# 3) Expand JSON to a flat list of "availability items"
+# -----------------------------------------------------
+
+- name: Derive naming defaults
+  ansible.builtin.set_fact:
+    org_alias: "{{ (naming.org_alias | default(id, true)) | default('org') }}"
+    env_alias: "{{ (naming.env_alias | default(env, true)) | default('env') }}"
+    name_prefix_cfg: "{{ naming.prefix | default('') }}"
+    name_pattern: "{{ naming.pattern | default('{{ org_alias }}-{{ env_alias }}-{{ module }}-{{ key }}') }}"
+
+- name: Compute effective name_prefix (env naming.prefix wins, else inventory namePrefix)
+  ansible.builtin.set_fact:
+    name_prefix: >-
+      {{ (name_prefix_cfg | length > 0) | ternary(name_prefix_cfg, name_prefix_from_inv | default('')) }}
+
+- name: Set module name for ID pattern
+  ansible.builtin.set_fact:
+    module: "procavail"
+
+- name: Build availability instance list (with os + metadata merge)
+  ansible.builtin.set_fact:
+    avail_instances: "{{ (avail_instances | default([])) + _rows }}"
+  vars:
+    _rows: >-
+      {%- set out = [] -%}
+
+      {%- set dmin = inv_defaults.min | default(1) -%}
+      {%- set d_os  = inv_defaults.os  | default([]) -%}
+      {# NEW: default enabled from inv.defaults.enabled, fallback true #}
+      {%- set d_enabled = (
+            inv_defaults.enabled
+            if (inv_defaults is mapping and inv_defaults.enabled is defined)
+            else true
+          ) -%}
+
+      {%- set d_meta_items = [] -%}
+      {%- if inv_defaults is mapping and inv_defaults.metadata is defined -%}
+        {%- if inv_defaults.metadata is mapping and ('items' in inv_defaults.metadata) -%}
+          {%- set d_meta_items = inv_defaults.metadata['items'] | default([]) -%}
+        {%- elif inv_defaults.metadata is iterable and (inv_defaults.metadata is not string) -%}
+          {%- set d_meta_items = inv_defaults.metadata | default([]) -%}
+        {%- endif -%}
+      {%- endif -%}
+
+      {%- for h in inv_hosts -%}
+        {%- set host_os = h.os | default(d_os) -%}
+
+        {%- set host_meta_items = d_meta_items -%}
+        {%- if h.metadata is defined -%}
+          {%- if h.metadata is mapping and ('items' in h.metadata) -%}
+            {%- set host_meta_items = d_meta_items + (h.metadata['items'] | default([])) -%}
+          {%- elif h.metadata is iterable and (h.metadata is not string) -%}
+            {%- set host_meta_items = d_meta_items + (h.metadata | default([])) -%}
+          {%- endif -%}
+        {%- endif -%}
+
+        {%- for hn in (h.names | default([])) -%}
+          {%- set fqdn = (hn if ('.' in hn) or (name_suffix | length == 0) else hn ~ name_suffix) -%}
+
+          {%- for p in (h.processes | default([])) -%}
+            {%- set p_name = p.name | default('proc') -%}
+            {%- set minv = (p.min is defined and p.min is not none) and (p.min | int) or dmin -%}
+            {%- set p_os = p.os | default(host_os) -%}
+
+            {%- set p_meta_items = [] -%}
+            {%- if p.metadata is defined -%}
+              {%- if p.metadata is mapping and ('items' in p.metadata) -%}
+                {%- set p_meta_items = p.metadata['items'] | default([]) -%}
+              {%- elif p.metadata is iterable and (p.metadata is not string) -%}
+                {%- set p_meta_items = p.metadata | default([]) -%}
+              {%- endif -%}
+            {%- endif -%}
+
+            {# merge metadata (host + process) with process overriding by key #}
+            {%- set all_items = host_meta_items + p_meta_items -%}
+            {%- set merged_map = {} -%}
+            {%- for it in all_items -%}
+              {%- if it.metadataKey is defined and it.metadataValue is defined -%}
+                {%- set _ = merged_map.update({ it.metadataKey: it.metadataValue }) -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- set merged_items = [] -%}
+            {%- for k, v in merged_map.items() -%}
+              {%- set _ = merged_items.append({'metadataKey': k, 'metadataValue': v}) -%}
+            {%- endfor -%}
+
+            {%- set final_os = (p_os if (p_os | length) > 0 else ['LINUX','WINDOWS']) -%}
+
+            {# normalize match dict; keep only known keys and non-empty values #}
+            {%- set m = p.match | default({}) -%}
+            {%- set allowed = [
+              'executable_eq','executable_contains','executable_prefix','executable_suffix',
+              'path_eq','path_contains','path_prefix','path_suffix',
+              'cmd_eq','cmd_contains','cmd_prefix','cmd_suffix'
+            ] -%}
+            {%- set norm = {} -%}
+            {%- for k in allowed -%}
+              {%- set val = m.get(k) -%}
+              {%- if val is defined and (val | default('', true) | trim | length) > 0 -%}
+                {%- set _ = norm.update({k: (val | string)}) -%}
+              {%- endif -%}
+            {%- endfor -%}
+
+            {%- set key = p_name ~ '-' ~ fqdn -%}
+            {%- set id_core = org_alias ~ '-' ~ env_alias ~ '-procavail-' ~ key -%}
+
+            {# NEW: compute effective enabled (row overrides, else default) #}
+            {%- set enabledv = (
+                  p.enabled
+                  if (p.enabled is defined)
+                  else d_enabled
+                ) -%}
+
+            {%- set rec = {
+              'id': (
+                ((name_prefix ~ '-') if (name_prefix | default('') | length > 0) else '')
+                ~ id_core
+              ) | regex_replace('[^A-Za-z0-9_-]', '-'),
+              'displayName': org_alias ~ '-' ~ env_alias ~ '-procavail-' ~ p_name ~ '-' ~ fqdn,
+              'name': p_name,
+              'host_name': fqdn,
+              'min': minv,
+              'os': final_os,
+              'metadata_items': merged_items,
+              'match': norm,
+              'enabled': enabledv
+            } -%}
+            {%- set _ = out.append(rec) -%}
+          {%- endfor -%}
+        {%- endfor -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: Validate each availability item has at least one matcher
+  ansible.builtin.assert:
+    that:
+      - av.match is defined
+      - (av.match | default({}) | length) > 0
+    fail_msg: "Process {{ av.id }} has no matchers set"
+    success_msg: "All assertions passed"
+  loop: "{{ avail_instances }}"
+  loop_control:
+    loop_var: av
+    label: "{{ av.id }}"
+
+# ------------------------------------------------
+# 4) Render availability payloads into the project
+# ------------------------------------------------
+
+- name: Build candidate paths for the availability payload template
+  ansible.builtin.set_fact:
+    payload_candidates:
+      - "{{ playbook_dir }}/modules/process-availability/availability.payload.json.j2"
+      - "{{ playbook_dir }}/../modules/process-availability/availability.payload.json.j2"
+
+- name: Stat candidate payload templates
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ payload_candidates }}"
+  register: payload_tpl_stats
+
+- name: Resolve availability payload template path
+  ansible.builtin.set_fact:
+    payload_template: >-
+      {{
+        (payload_tpl_stats.results
+          | selectattr('stat.exists')
+          | map(attribute='item')
+          | list
+          | first
+          | default(''))
+      }}
+
+- name: Fail if payload template not found
+  ansible.builtin.fail:
+    msg: >-
+      Could not locate availability payload template. Checked: {{ payload_candidates | join(', ') }}
+  when: (payload_template | default('')) | length == 0
+
+- name: Render availability payloads into project/payloads
+  ansible.builtin.template:
+    src: "{{ payload_template }}"
+    dest: "{{ payloads_dir }}/{{ av.id }}.json"
+    mode: "0644"
+  loop: "{{ avail_instances | default([]) }}"
+  loop_control:
+    loop_var: av
+    label: "{{ av.displayName }}"
+
+# Visibility & guardrails on rendered payloads
+- name: Count rendered payload JSON files (in project)
+  ansible.builtin.find:
+    paths: "{{ payloads_dir }}"
+    patterns: "*.json"
+  register: rendered_payloads
+
+- name: Show rendered payload count + sample
+  ansible.builtin.debug:
+    msg:
+      - "rendered_payload_count={{ rendered_payloads.matched }}"
+      - "first_five={{ (rendered_payloads.files | map(attribute='path') | list)[0:5] | default([]) }}"
+
+- name: Warn when no payloads were rendered (empty inventory is allowed)
+  ansible.builtin.debug:
+    msg: >
+      No availability payloads rendered (hosts list empty). We'll still write an empty config.yaml,
+      and the downstream prune step will remove SSOT-owned Process Availability objects.
+  when: (rendered_payloads.matched | int) == 0
+
+# --------------------------------------------
+# 5) Render project config.yaml (Monaco v2)
+# --------------------------------------------
+
+- name: Render Monaco project configs.yaml
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/modules/process-availability/config.yaml.j2"
+    dest: "{{ monaco_project_abs }}/config.yaml"
+    mode: "0644"
+  vars:
+    avail_instances: "{{ avail_instances }}"
+
+# --------------------------------------------
+# 6) Manifest rendering (so CI knows the project)
+# --------------------------------------------
+
+- name: Set default rendered_manifest path (if not provided)
+  ansible.builtin.set_fact:
+    rendered_manifest: "{{ rendered_manifest | default(playbook_dir ~ '/../.generated/manifest.yaml') }}"
+
+- name: Render Monaco manifest (idempotent)
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/templates/manifest.yaml.j2"
+    dest: "{{ rendered_manifest }}"
+    mode: "0644"
+  vars:
+    cfg:
+      env: "{{ environment_name | default(env) }}"
+      url: "{{ url }}"
+      token: "{{ token }}"
+    projects:
+      - name: "process-availability"
+        path: "{{ monaco_project_rel }}"
+
+- name: Compute execution mode (no self-reference)
+  ansible.builtin.set_fact:
+    exec_mode: "{{ run_mode | default('plan') }}"

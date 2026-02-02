@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "defaults": {
+    "min": 1,
+    "os": ["LINUX"],
+    "metadata": [
+      { "metadataKey": "Event-Category",  "metadataValue": "APP" },
+      { "metadataKey": "Event-Recipient", "metadataValue": "n/a" }
+    ]
+  },
+  "hosts": [
+    {
+      "names": [],
+      "processes": [
+        { "name": "", "match": { "executable_eq": "" } },
+        { "name": "",  "match": { "executable_eq": "" } }
+      ]
+    }
+  ]
+}

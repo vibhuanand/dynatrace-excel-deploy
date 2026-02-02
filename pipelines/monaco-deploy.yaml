@@ -1,0 +1,700 @@
+# pipelines/monaco-deploy.yaml
+trigger: none
+
+
+
+# ---------- Parameters ----------
+parameters:
+- name: mission_space
+  displayName: 'Mission Space (Org)'
+  type: string
+  default: cra
+  values: [cra, statscan]
+
+- name: environment
+  displayName: 'Environment'
+  type: string
+  default: prod
+  values: [dev, prod]
+
+- name: run_mode
+  displayName: 'Action'
+  type: string
+  default: plan
+  values: [plan, dry-run, apply]
+
+- name: online_agent_pool
+  displayName: 'Deploy agent (self-hosted pool)'
+  type: string
+  values: ['vibhu_machine']
+
+- name: project_name
+  displayName: 'Dynatrace project name'
+  type: string
+  values: ['process-availability']
+
+# ---------- Variables ----------
+variables:
+  PLAYBOOK: ansible/site.yaml
+  MONACO_VERSION: '2.23.0'
+
+# ---------- Stages ----------
+stages:
+
+# ===== Build (offline: render manifest/payloads; no Dynatrace calls) =====
+- stage: BuildManifest
+  displayName: 'Render manifest & payloads (offline)'
+  jobs:
+  - job: Compose
+    displayName: 'Compose manifest & payloads (offline)'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+
+    - task: Bash@3
+      displayName: 'Agent diagnostics (Build)'
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+
+          show() {
+            # prints VAR=VALUE (empty if unset)
+            local k="$1"
+            # ${!k:-} expands to empty if unset
+            printf '%s=%s\n' "$k" "${!k:-}"
+          }
+
+          for v in \
+            AGENT_NAME AGENT_MACHINE_NAME AGENT_OS AGENT_VERSION \
+            AGENT_HOMEDIRECTORY AGENT_WORKFOLDER SYSTEM_POOLID SYSTEM_POOLNAME
+          do
+            show "$v"
+          done
+
+          echo "Hostname: $(hostname -f)"
+
+
+    - checkout: self
+      clean: true
+      fetchDepth: 0
+      submodules: recursive
+      persistCredentials: true
+      lfs: true
+
+    - task: Bash@3
+      displayName: 'Git LFS sanity pull (Build)'
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+          git lfs install
+          git lfs fetch --all
+          git lfs pull
+
+
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '3.x'
+
+    - task: Bash@3
+      displayName: 'Install Ansible + yq'
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install "ansible==9.*" pyyaml openpyxl
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          ansible --version
+          yq --version
+
+
+    - task: Bash@3
+      displayName: 'Resolve & sanity-check SSOT + inventory'
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+          ENV_FILE="envs/${{ parameters.mission_space }}/${{ parameters.environment }}.yaml"
+          python3 pipelines/scripts/ssot_inventory_check.py --env-file "${ENV_FILE}"
+
+
+    - task: Bash@3
+      displayName: 'Run compose (Ansible render only, OFFLINE)'
+      env:
+        ANSIBLE_FORCE_COLOR: '1'
+        ANSIBLE_HOST_KEY_CHECKING: 'False'
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+          echo "Running Ansible with SSOT: $(SSOT_ABS)"
+
+          # Force offline mode: lookup_hosts=false
+          ansible-playbook -i localhost, -c local "$(PLAYBOOK)" \
+            -e "ansible_connection=local" \
+            -e "ssot_file=$(SSOT_ABS)" \
+            -e "env_file=$(SSOT_ABS)" \
+            -e "lookup_hosts=false" \
+            -e "run_mode=${{ parameters.run_mode }}" \
+            -e "mission_space=${{ parameters.mission_space }}" \
+            -e "environment_name=${{ parameters.environment }}"
+
+          # Ensure manifest exists where CI expects it
+          if [ ! -f .generated/manifest.yaml ]; then
+            echo "##vso[task.logissue type=warning]manifest.yaml not in default path; scanning..."
+            cand="$(find . -maxdepth 5 -type f -iname 'manifest*.yaml' -not -path './.git/*' | head -n1 || true)"
+            if [ -n "${cand}" ]; then
+              mkdir -p .generated
+              cp "${cand}" .generated/manifest.yaml
+            fi
+          fi
+
+          if [ ! -f .generated/manifest.yaml ]; then
+            echo "##vso[task.logissue type=error].generated/manifest.yaml not found (compose likely wrote it elsewhere or failed)."
+            exit 2
+          fi
+
+    - task: Bash@3
+      displayName: 'Stage Monaco project into .generated'
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+          mkdir -p .generated/ansible/modules
+          rm -rf .generated/ansible/modules/process-availability
+          cp -a ansible/modules/process-availability .generated/ansible/modules/
+          echo "Staged tree:"
+          find .generated/ansible/modules/process-availability -maxdepth 2 -type f -print | sed 's/^/   /'
+
+    - task: Bash@3
+      name: verifyStaged
+      displayName: 'Verify staged Monaco project has configs/payloads'
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+
+          GEN_DIR=".generated"
+          PROJ_DIR="$GEN_DIR/ansible/modules/process-availability"
+          PAYLOAD_DIR="$PROJ_DIR/payloads"
+
+          echo "GEN_DIR=$GEN_DIR"
+          echo "PROJ_DIR=$PROJ_DIR"
+          echo "PAYLOAD_DIR=$PAYLOAD_DIR"
+
+          COUNT=$(find "$PAYLOAD_DIR" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+          echo "Staged payload count: $COUNT"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No payloads to deploy. This can be intentional (empty inventory)."
+            echo "##vso[task.setvariable variable=HAS_PAYLOADS;isOutput=true]false"
+          else
+            echo "Found $COUNT payload(s) to deploy."
+            echo "##vso[task.setvariable variable=HAS_PAYLOADS;isOutput=true]true"
+          fi
+
+
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish generated manifest & payloads'
+      inputs:
+        targetPath: '.generated'
+        artifact: 'generated'
+        publishLocation: 'pipeline'
+
+    # ===== Deploy (on your laptop runner) =====
+# ===== Deploy (on your laptop runner) =====
+- stage: Deploy
+  displayName: 'Resolve scopes + Monaco deploy (online)'
+  dependsOn: BuildManifest
+  condition: ne('${{ parameters.run_mode }}','plan')
+  jobs:
+  - job: ResolveAndDeploy
+    displayName: 'Resolve HOST entity IDs, then deploy via Monaco'
+    pool:
+      name: ${{ parameters.online_agent_pool }}
+      demands:
+      - dynatrace-reach -equals yes
+    steps:
+
+    - task: PowerShell@2
+      displayName: 'Agent diagnostics (Deploy)'
+      inputs:
+        targetType: inline
+        script: |
+          $vars = "AGENT_NAME","AGENT_MACHINE_NAME","AGENT_OS","AGENT_VERSION","AGENT_HOMEDIRECTORY","AGENT_WORKFOLDER","SYSTEM_POOLID","SYSTEM_POOLNAME"
+          $vars | ForEach-Object { Write-Host "$_=$([Environment]::GetEnvironmentVariable($_))" }
+          Write-Host "Hostname: $([System.Net.Dns]::GetHostName())"
+
+    - checkout: self
+      clean: true
+      fetchDepth: 0
+      submodules: recursive
+      persistCredentials: true
+      lfs: true
+
+    - task: PowerShell@2
+      displayName: 'Git LFS sanity pull (Deploy)'
+      inputs:
+        targetType: inline
+        script: |
+          git lfs install
+          git lfs fetch --all
+          git lfs pull
+
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download generated artifact'
+      inputs:
+        buildType: current
+        artifact: generated
+        targetPath: '$(Pipeline.Workspace)/generated'
+
+    - task: PowerShell@2
+      displayName: 'Recount payloads in Deploy stage'
+      inputs:
+        targetType: inline
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $pdir = Join-Path '$(Pipeline.Workspace)' 'generated\ansible\modules\process-availability\payloads'
+          $count = 0
+          if (Test-Path $pdir) {
+            $count = (Get-ChildItem -Path $pdir -Filter *.json -ErrorAction SilentlyContinue | Measure-Object).Count
+          }
+          Write-Host "Payloads found in Deploy stage: $count"
+          if ($count -gt 0) {
+            Write-Host "##vso[task.setvariable variable=HAS_PAYLOADS_DEPLOY]true"
+          } else {
+            Write-Host "##vso[task.setvariable variable=HAS_PAYLOADS_DEPLOY]false"
+          }
+
+
+    - task: PowerShell@2
+      displayName: 'Resolve HOST scopes (Python, vibhu_machine)'
+      condition: and(succeeded(), eq(variables.HAS_PAYLOADS_DEPLOY, 'true'))
+
+      env:
+        DT_TOKEN_CRA_PROD: $(DT_TOKEN_CRA_PROD)
+      inputs:
+        targetType: inline
+        script: |
+          $ErrorActionPreference = 'Stop'
+
+          # Ensure Python + PyYAML on the self-hosted agent
+          python --version
+          python -m pip install --upgrade pip
+          python -m pip install pyyaml
+
+          # Paths
+          $src  = "$(Build.SourcesDirectory)"
+          $gen  = Join-Path "$(Pipeline.Workspace)" 'generated'
+          $proj = Join-Path $gen 'ansible\modules\process-availability'
+          $pdir = Join-Path $proj 'payloads'
+          $cfg  = Join-Path $proj 'config.yaml'
+          [Environment]::SetEnvironmentVariable('GEN_DIR', $gen, 'Process')
+          if (!(Test-Path $pdir)) { throw "Payloads folder not found: $pdir" }
+          if (!(Test-Path $cfg))  { throw "config.yaml not found: $cfg" }
+
+          # Find resolver (support both correct and legacy-typo paths)
+          $candidates = @(
+            (Join-Path $src 'pipelines\script\resolve_host_scopes.py'),
+            (Join-Path $src 'pipelines\scripts\resolve_host_scopes.py'),
+            (Join-Path $src 'pipelines\script\resolve_host_scopes.py')
+          )
+          $py = $null
+          foreach ($p in $candidates) { if (Test-Path $p) { $py = $p; break } }
+          if (-not $py) {
+            $g = Get-ChildItem -Path $src -Recurse -Filter resolve_host_scopes.py -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($g) { $py = $g.FullName }
+          }
+          if (-not $py) { throw "Resolver script not found. Expected 'pipelines/script/resolve_host_scopes.py'." }
+          Write-Host "Resolving HOST scopes via: $py"
+
+          # Read base URL from generated manifest
+          $manifest = Join-Path $gen 'manifest.yaml'
+          if (!(Test-Path $manifest)) { throw "Manifest not found: $manifest" }
+          $manifestText = Get-Content $manifest -Raw
+          $envName   = '${{ parameters.environment }}'
+          $envNameRe = [regex]::Escape($envName)
+          $patterns  = @(
+            "(?ms)-\s*name:\s*""?$envNameRe""?\s*.*?\burl:\s*(?:\r?\n\s*type:\s*\S+\s*)?\r?\n\s*value:\s*""?([^\r\n#""\s]+)",
+            "(?ms)-\s*name:\s*""?$envNameRe""?\s*.*?\burl:\s*""?([^\r\n#""\s]+)"
+          )
+          $baseUrl = $null
+          foreach ($pat in $patterns) {
+            $m = [regex]::Match($manifestText, $pat)
+            if ($m.Success) { $baseUrl = $m.Groups[1].Value.Trim('"'); break }
+          }
+          if (-not $baseUrl) { throw "Base URL for environment '$envName' not found in manifest." }
+
+          # Token from pipeline secret
+          $tok = $env:DT_TOKEN_CRA_PROD
+          if ([string]::IsNullOrWhiteSpace($tok)) { throw "DT_TOKEN_CRA_PROD is empty on the agent." }
+          $tok = $tok.Trim()
+
+          # --- IMPORTANT: export env vars expected by the resolver ---
+          [Environment]::SetEnvironmentVariable('DT_BASE_URL', $baseUrl, 'Process')
+          [Environment]::SetEnvironmentVariable('DT_TOKEN',    $tok,     'Process')
+          # (Optional) if your resolver also supports these via envs:
+          [Environment]::SetEnvironmentVariable('PAYLOAD_DIR', $pdir, 'Process')
+          [Environment]::SetEnvironmentVariable('CONFIG_PATH', $cfg,  'Process')
+
+          # Call resolver (no flags needed if it reads env vars).
+          # Keep payload/config flags too in case your script supports both styles.
+          & python $py --payload-dir $pdir --config-path $cfg
+          if ($LASTEXITCODE -ne 0) { throw "Resolver exited with code $LASTEXITCODE" }
+
+    - task: PowerShell@2
+      displayName: 'Flag: any configs after resolve?'
+      inputs:
+        targetType: inline
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $cfg = Join-Path '$(Pipeline.Workspace)' 'generated\ansible\modules\process-availability\config.yaml'
+          if (!(Test-Path $cfg)) { throw "config.yaml not found: $cfg" }
+
+          $tmp = [System.IO.Path]::GetTempFileName() + ".py"
+          @"
+          import yaml, sys
+          p=r'$cfg'
+          data = yaml.safe_load(open(p,'r',encoding='utf-8')) or {}
+          items = data.get('configs') or []
+          print(len(items))
+          "@ | Set-Content -Path $tmp -Encoding UTF8
+
+          $cnt = [int](& python $tmp)
+          Remove-Item $tmp -Force
+
+          Write-Host "Configs after resolve: $cnt"
+          if ($cnt -gt 0) {
+            Write-Host "##vso[task.setvariable variable=HAS_CONFIGS_AFTER_RESOLVE]true"
+          } else {
+            Write-Host "##vso[task.setvariable variable=HAS_CONFIGS_AFTER_RESOLVE]false"
+          }
+
+
+    - task: PowerShell@2
+      displayName: 'List skipped hosts (non-fatal)'
+      inputs:
+        targetType: inline
+        script: |
+          $skippedFile = Join-Path '$(Pipeline.Workspace)' 'generated\resolve_skipped.txt'
+          if (Test-Path $skippedFile) {
+            Write-Host "=== Skipped hosts ==="
+            Get-Content $skippedFile | ForEach-Object {
+              # Each line has "<configId><TAB><fqdn>"
+              $parts = $_ -split "`t", 2
+              if ($parts.Length -eq 2) {
+                Write-Host ("- ConfigId: {0}, Host: {1}" -f $parts[0], $parts[1])
+              } else {
+                Write-Host ("- {0}" -f $_)
+              }
+            }
+          } else {
+            Write-Host "No skipped hosts."
+          }
+
+
+
+    - task: PowerShell@2
+      displayName: 'Guard: payloads & config are clean before deploy'
+      inputs:
+        targetType: inline
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $payloads = Join-Path '$(Pipeline.Workspace)' 'generated\ansible\modules\process-availability\payloads'
+          $cfg      = Join-Path '$(Pipeline.Workspace)' 'generated\ansible\modules\process-availability\config.yaml'
+
+          if (!(Test-Path $payloads)) { throw "Payloads folder not found: $payloads" }
+          if (!(Test-Path $cfg))      { throw "config.yaml not found: $cfg" }
+
+          # Surface skipped hosts (non-fatal)
+          $skippedFile = Join-Path '$(Pipeline.Workspace)' 'generated\resolve_skipped.txt'
+          if (Test-Path $skippedFile) {
+            Write-Warning "Some scopes were skipped (non-fatal). Listing from ${skippedFile}:"
+            Get-Content $skippedFile | ForEach-Object { Write-Warning ("  {0}" -f $_) }
+          }
+
+          # Must NOT contain legacy xHostName in any payload
+          $badPayloads = Get-ChildItem $payloads -Recurse -Filter *.json | Where-Object {
+            Select-String -Path $_.FullName -Pattern '"xHostName"\s*:' -Quiet
+          }
+          if ($badPayloads) { throw "xHostName still present in some payloads. Fix resolver." }
+
+          # Diagnose all 'scope:' lines; fail if any value is not HOST-...
+          $pattern = '^\s*scope:\s*(.+)$'
+          $bad = @()
+          Get-Content $cfg | ForEach-Object {
+            if ($_ -match $pattern) {
+              $raw = $Matches[1].Trim()
+              # strip surrounding quotes, if present
+              if ($raw.StartsWith('"') -and $raw.EndsWith('"')) {
+                $raw = $raw.Substring(1, $raw.Length - 2)
+              }
+              if ($raw -notmatch '^HOST-[A-Z0-9]+$') {
+                $bad += $_.Trim()
+              }
+            }
+          }
+
+          if ($bad.Count -gt 0) {
+            Write-Host "Found non-HOST scopes in config.yaml:"
+            $bad | ForEach-Object { Write-Host ("  {0}" -f $_) }
+            throw "Found non-HOST scope(s) in config.yaml. Per-host only is enforced."
+          }
+
+          Write-Host "Guard checks passed."
+
+
+
+    - task: PowerShell@2
+      displayName: 'Dynatrace preflight from this agent'
+      env:
+        DT_TOKEN_CRA_PROD: $(DT_TOKEN_CRA_PROD)
+      inputs:
+        targetType: inline
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $gen = Join-Path $env:PIPELINE_WORKSPACE 'generated'
+          $manifest = Join-Path $gen 'manifest.yaml'
+          if (!(Test-Path $manifest)) { throw "Manifest not found: $manifest" }
+          $manifestText = Get-Content $manifest -Raw
+
+          $envName   = '${{ parameters.environment }}'
+          $envNameRe = [regex]::Escape($envName)
+          $patterns  = @(
+            "(?ms)-\s*name:\s*""?$envNameRe""?\s*.*?\burl:\s*(?:\r?\n\s*type:\s*\S+\s*)?\r?\n\s*value:\s*""?([^\r\n#""\s]+)",
+            "(?ms)-\s*name:\s*""?$envNameRe""?\s*.*?\burl:\s*""?([^\r\n#""\s]+)"
+          )
+          $baseUrl = $null
+          foreach ($pat in $patterns) {
+            $m = [regex]::Match($manifestText, $pat)
+            if ($m.Success) { $baseUrl = $m.Groups[1].Value.Trim('"'); break }
+          }
+          if (-not $baseUrl) { throw "Base URL for environment '$envName' not found in manifest." }
+          Write-Host "Base URL: $baseUrl"
+
+          $tok = $env:DT_TOKEN_CRA_PROD
+          if (-not $tok) { throw "DT_TOKEN_CRA_PROD is empty on the agent." }
+          $tok = $tok.Trim()
+
+          $u1 = ($baseUrl.TrimEnd('/')) + '/api/v1/time'
+          try {
+            $r1 = Invoke-WebRequest -UseBasicParsing -Uri $u1 -Headers @{ Authorization = "Api-Token $tok" } -Method GET -TimeoutSec 20
+            Write-Host "Preflight GET /api/v1/time -> HTTP $([int]$r1.StatusCode)"
+          } catch {
+            $code = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { -1 }
+            $body = try { if ($_.Exception.Response) { (New-Object IO.StreamReader $_.Exception.Response.GetResponseStream()).ReadToEnd() } } catch { '' }
+            throw "Preflight failed -> HTTP $code. URL=$baseUrl. Body=$body"
+          }
+
+    - task: PowerShell@2
+      displayName: 'Guard: no xHostName & no HOST-PLACEHOLDER left'
+      condition: and(succeeded(), eq(variables.HAS_CONFIGS_AFTER_RESOLVE, 'true'))
+
+      inputs:
+        targetType: inline
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $payloads = Join-Path '$(Pipeline.Workspace)' 'generated\ansible\modules\process-availability\payloads'
+          if (!(Test-Path $payloads)) { throw "Payloads folder not found: $payloads" }
+
+          $bad1 = Get-ChildItem $payloads -Recurse -Filter *.json | Where-Object {
+            Select-String -Path $_.FullName -Pattern '"xHostName"\s*:' -Quiet
+          }
+          if ($bad1) { throw "xHostName still present in some payloads. Fix resolver." }
+
+          $cfg = Join-Path '$(Pipeline.Workspace)' 'generated\ansible\modules\process-availability\config.yaml'
+          if (!(Test-Path $cfg)) { throw "config.yaml not found: $cfg" }
+
+          if (Select-String -Path $cfg -Pattern 'scope:\s*"?(HOST-PLACEHOLDER)"?' -Quiet) {
+            throw "config.yaml still contains HOST-PLACEHOLDER scopes. Resolve before deploy."
+          }
+
+          Write-Host "Guard checks passed."
+
+
+    - task: PowerShell@2
+      displayName: 'Safe prune (SSOT-owned Process Availability)'
+      env:
+        DT_TOKEN_CRA_PROD: $(DT_TOKEN_CRA_PROD)
+      inputs:
+        targetType: inline
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+
+          # --- 1) Read Dynatrace base URL from the generated manifest ---
+          $gen = Join-Path $env:PIPELINE_WORKSPACE 'generated'
+          $manifest = Join-Path $gen 'manifest.yaml'
+          if (!(Test-Path $manifest)) { throw "Manifest not found: $manifest" }
+          $text = Get-Content $manifest -Raw
+
+          $envName   = '${{ parameters.environment }}'
+          $envNameRe = [regex]::Escape($envName)
+          $patterns  = @(
+            "(?ms)-\s*name:\s*""?$envNameRe""?\s*.*?\burl:\s*(?:\r?\n\s*type:\s*\S+\s*)?\r?\n\s*value:\s*""?([^\r\n#""\s]+)",
+            "(?ms)-\s*name:\s*""?$envNameRe""?\s*.*?\burl:\s*""?([^\r\n#""\s]+)"
+          )
+          $baseUrl = $null
+          foreach ($pat in $patterns) {
+            $m = [regex]::Match($text, $pat)
+            if ($m.Success) { $baseUrl = $m.Groups[1].Value.Trim('"'); break }
+          }
+          if (-not $baseUrl) { throw "Could not parse base URL from manifest for env '$envName'." }
+
+          # --- 2) Token ---
+          $tok = $env:DT_TOKEN_CRA_PROD
+          if ([string]::IsNullOrWhiteSpace($tok)) { throw "DT_TOKEN_CRA_PROD is empty" }
+          $tok = $tok.Trim()
+
+          # --- 3) Rendered Monaco project path (desired state) ---
+          $proj = Join-Path $gen 'ansible\modules\process-availability'
+          if (!(Test-Path (Join-Path $proj 'config.yaml'))) { throw "Project config not found: $proj\config.yaml" }
+
+          # --- 4) Ensure Python + PyYAML are ready for reconcile_settings.py ---
+          python --version
+          python -m pip install --upgrade pip
+          python -m pip install pyyaml
+
+          # --- 5) Compute the repo-owned name-prefix **in PowerShell** (no inline Python) ---
+          $ssotRel = "envs/${{ parameters.mission_space }}/${{ parameters.environment }}.yaml"
+          $ssotAbs = Join-Path '$(Build.SourcesDirectory)' $ssotRel
+          if (!(Test-Path $ssotAbs)) { throw "SSOT not found: $ssotAbs" }
+
+          $ssotText = Get-Content $ssotAbs -Raw
+
+          function Get-YamlValue([string]$Text, [string]$Key) {
+            $m = [regex]::Match($Text, "^\s*$([regex]::Escape($Key))\s*:\s*(.+)$", 'Multiline')
+            if ($m.Success) {
+              return $m.Groups[1].Value.Trim('"').Trim("'").Trim()
+            }
+            return $null
+          }
+
+          # org_alias/env_alias may appear under "naming:" or top-level fallbacks "id"/"env"
+          $org = Get-YamlValue $ssotText 'org_alias'
+          if (-not $org) {
+            $m = [regex]::Match($ssotText, "^\s*naming\s*:\s*(?>\r?\n|\r)\s*(?:.+\r?\n)*?\s*org_alias\s*:\s*(.+)$", 'Multiline')
+            if ($m.Success) { $org = $m.Groups[1].Value.Trim('"').Trim("'").Trim() }
+          }
+          if (-not $org) { $org = Get-YamlValue $ssotText 'id' }
+          if (-not $org) { $org = 'org' }
+
+          $envVal = Get-YamlValue $ssotText 'env_alias'
+          if (-not $envVal) {
+            $m2 = [regex]::Match($ssotText, "^\s*naming\s*:\s*(?>\r?\n|\r)\s*(?:.+\r?\n)*?\s*env_alias\s*:\s*(.+)$", 'Multiline')
+            if ($m2.Success) { $envVal = $m2.Groups[1].Value.Trim('"').Trim("'").Trim() }
+          }
+          if (-not $envVal) { $envVal = Get-YamlValue $ssotText 'env' }
+          if (-not $envVal) { $envVal = 'env' }
+
+          $namePrefix = "$org-$envVal-procavail-"
+          if ([string]::IsNullOrWhiteSpace($namePrefix)) { throw "Failed to compute name-prefix from $ssotAbs" }
+          Write-Host "Using name-prefix: $namePrefix"
+
+          # --- 6) Locate reconcile_settings.py (your version that supports --name-prefix) ---
+          $candidates = @(
+            (Join-Path '$(Build.SourcesDirectory)' 'pipelines\scripts\reconcile_settings.py'),
+            (Join-Path '$(Build.SourcesDirectory)' 'pipelines\scripts\reconcile_settings.py'),
+            (Join-Path '$(Build.SourcesDirectory)' 'pipelines\script\reconcile_settings.py'),
+            (Join-Path '$(Build.SourcesDirectory)' 'pipelines\script\reconcile_settings.py')
+          )
+          $recon = $null
+          foreach ($p in $candidates) { if (Test-Path $p) { $recon = $p; break } }
+          if (-not $recon) {
+            $g = Get-ChildItem -Path '$(Build.SourcesDirectory)' -Recurse -Filter reconcile_settings.py -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($g) { $recon = $g.FullName }
+          }
+          if (-not $recon) { throw "reconcile_settings.py not found anywhere under $(Build.SourcesDirectory)" }
+
+          # --- 7) Mode ---
+          $mode = if ('${{ parameters.run_mode }}' -eq 'apply') { 'apply' } else { 'dry-run' }
+          Write-Host "Safe prune mode: $mode"
+
+          # --- 8) Run prune (by name-prefix; **no --project-tag**) ---
+          & python $recon `
+            --base-url "$baseUrl" `
+            --token "$tok" `
+            --project-dir "$proj" `
+            --schema "builtin:processavailability" `
+            --name-prefix "$namePrefix" `
+            --mode "$mode"
+
+          if ($LASTEXITCODE -ne 0) { throw "Safe prune exited with $LASTEXITCODE" }
+
+    - task: PowerShell@2
+      displayName: 'Deploy to Dynatrace (Monaco)'
+      condition: and(succeeded(), eq(variables.HAS_CONFIGS_AFTER_RESOLVE, 'true'))
+      env:
+        DT_TOKEN_CRA_PROD: $(DT_TOKEN_CRA_PROD)
+      inputs:
+        targetType: inline
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+
+          $gen = Join-Path $env:PIPELINE_WORKSPACE 'generated'
+          if (!(Test-Path $gen)) { throw "Generated artifact not found: $gen" }
+          Set-Location $gen
+
+          $manifest = 'manifest.yaml'
+          if (!(Test-Path $manifest)) { throw "Manifest not found in generated folder: $gen\$manifest" }
+
+          $ver  = "$(MONACO_VERSION)"
+          $url  = "https://github.com/Dynatrace/dynatrace-configuration-as-code/releases/download/v$ver/monaco-windows-amd64.exe"
+          $dest = Join-Path $env:Agent_TempDirectory 'monaco.exe'
+          Write-Host "Downloading $url..."
+          Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $dest
+          & $dest version
+
+          $manifestText = Get-Content $manifest -Raw
+          $envName   = '${{ parameters.environment }}'
+          $envNameRe = [regex]::Escape($envName)
+          $patterns  = @(
+            "(?ms)-\s*name:\s*""?$envNameRe""?\s*.*?\burl:\s*(?:\r?\n\s*type:\s*\S+\s*)?\r?\n\s*value:\s*""?([^\r\n#""\s]+)",
+            "(?ms)-\s*name:\s*""?$envNameRe""?\s*.*?\burl:\s*""?([^\r\n#""\s]+)"
+          )
+          $baseUrl = $null
+          foreach ($pat in $patterns) {
+            $m = [regex]::Match($manifestText, $pat)
+            if ($m.Success) { $baseUrl = $m.Groups[1].Value.Trim('"'); break }
+          }
+          if (-not $baseUrl) { throw "Base URL for environment '$envName' not found in manifest." }
+
+          $expectedVar = ([regex]'(?im)^\s*#\s*xAuthTokenVar:\s*"?([A-Za-z0-9_]+)"?\s*$').Match($manifestText).Groups[1].Value
+          if (-not $expectedVar) {
+            $expectedVar = ([regex]'(?is)\bauth\s*:\s*(?:\r?\n|\s)+\btoken\s*:\s*(?:\r?\n|\s)+\bname\s*:\s*"?([A-Za-z0-9_]+)"?').Match($manifestText).Groups[1].Value
+          }
+          if (-not $expectedVar) { throw "auth.token.name missing in manifest (and xAuthTokenVar comment not present)." }
+
+          $tok = [Environment]::GetEnvironmentVariable($expectedVar)
+          if (-not $tok) { throw "$expectedVar is empty on the agent. Define it as a secret variable with that exact name." }
+          if ($tok -match '^\$\([^)]+\)$') { throw "$expectedVar was not expanded (saw literal '$tok'). Make sure it's linked as a secret variable." }
+          $tok = $tok.Trim()
+          [Environment]::SetEnvironmentVariable($expectedVar, $tok, 'Process')
+          if ($tok.Length -gt 8) { Write-Host ("Using {0}={1}…{2}" -f $expectedVar, $tok.Substring(0,4), $tok.Substring($tok.Length-4,4)) }
+
+          Remove-Item env:HTTPS_PROXY, env:HTTP_PROXY, env:NO_PROXY -ErrorAction SilentlyContinue
+
+          try {
+            $u1 = ($baseUrl.TrimEnd('/')) + '/api/v1/time'
+            $r1 = Invoke-WebRequest -UseBasicParsing -Uri $u1 -Headers @{ Authorization = "Api-Token $tok" } -Method GET -TimeoutSec 20
+            Write-Host "Preflight GET /api/v1/time -> HTTP $([int]$r1.StatusCode)"
+
+            $u2 = ($baseUrl.TrimEnd('/')) + '/api/v1/config/clusterversion'
+            $r2 = Invoke-WebRequest -UseBasicParsing -Uri $u2 -Headers @{ Authorization = "Api-Token $tok" } -Method GET -TimeoutSec 20
+            Write-Host "Preflight GET /api/v1/config/clusterversion -> HTTP $([int]$r2.StatusCode)"
+          } catch {
+            $code = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { -1 }
+            $body = try { if ($_.Exception.Response) { (New-Object IO.StreamReader $_.Exception.Response.GetResponseStream()).ReadToEnd() } } catch { '' }
+            throw "Preflight failed -> HTTP $code. URL=$baseUrl. Body=$body"
+          }
+
+          $args = @('deploy', $manifest, '-e', $envName, '-v')
+          if ('${{ parameters.run_mode }}' -eq 'dry-run') { $args += '--dry-run' }
+          & $dest @args
+          if ($LASTEXITCODE -ne 0) { throw "Monaco exited with code $LASTEXITCODE" }
+

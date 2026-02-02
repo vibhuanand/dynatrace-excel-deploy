@@ -1,0 +1,22 @@
+# ansible/templates/manifest.yaml.j2
+# Rendered by Ansible from SSOT (cfg)
+manifestVersion: 1.0
+
+# xAuthTokenVar: {{ cfg.token }}
+
+projects:
+{% for p in projects %}
+  - name: "{{ p.name }}"
+    path: "{{ p.path }}"
+{% endfor %}
+
+environmentGroups:
+  - name: default
+    environments:
+      - name: "{{ cfg.env }}"
+        url:
+          value: "{{ cfg.url }}"
+        auth:
+          token:
+            name: "{{ cfg.token }}"
+

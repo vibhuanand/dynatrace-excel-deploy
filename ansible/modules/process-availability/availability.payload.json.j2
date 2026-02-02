@@ -1,0 +1,56 @@
+{
+  "enabled": {{ (
+                  av.enabled
+                  if av.enabled is defined
+                  else (av.defaults_enabled | default(true))
+               ) | tojson }},
+  "name": "{{ av.displayName }}",
+  "minimumProcesses": {{ av.min | int }},
+  "operatingSystem": {{ av.os | to_json }},
+  "xHostName": "{{ av.host_name }}",
+
+  {# ---- Build Dynatrace rules (RuleTypeProcess + property/condition) ---- #}
+  {% set keymap = {
+    'executable_eq':       ('executable',      'eq'),
+    'executable_contains': ('executable',      'contains'),
+    'executable_prefix':   ('executable',      'prefix'),
+    'executable_suffix':   ('executable',      'suffix'),
+    'path_eq':             ('executablePath',  'eq'),
+    'path_contains':       ('executablePath',  'contains'),
+    'path_prefix':         ('executablePath',  'prefix'),
+    'path_suffix':         ('executablePath',  'suffix'),
+    'cmd_eq':              ('commandLine',     'eq'),
+    'cmd_contains':        ('commandLine',     'contains'),
+    'cmd_prefix':          ('commandLine',     'prefix'),
+    'cmd_suffix':          ('commandLine',     'suffix')
+  } %}
+  {% set rules_list = [] %}
+  {% for k, v in (av.match or {}).items() %}
+    {% set m = keymap.get(k) %}
+    {% if m and (v|string)|trim|length > 0 %}
+      {% set _ = rules_list.append({
+        'ruleType': 'RuleTypeProcess',
+        'property': m[0],
+        'condition': '$' ~ m[1] ~ '(' ~ v ~ ')'
+      }) %}
+    {% endif %}
+  {% endfor %}
+  "rules": {{ rules_list | to_json }},
+
+  {# ---- Metadata: merge user-provided items with SSOT-managed keys ---- #}
+  {% set managed_items = [
+      {'metadataKey': 'ManagedBy',  'metadataValue': 'SSOT'}
+    ] %}
+  {% set base_items = (av.metadata_items | default([])) %}
+  {% set merged = {} %}
+  {% for it in (base_items + managed_items) %}
+    {% if it.metadataKey is defined and it.metadataValue is defined %}
+      {% set _ = merged.update({ it.metadataKey: it.metadataValue }) %}
+    {% endif %}
+  {% endfor %}
+  {% set items = [] %}
+  {% for k, v in merged.items() %}
+    {% set _ = items.append({'metadataKey': k, 'metadataValue': v}) %}
+  {% endfor %}
+  "metadata": {{ items | to_json }}
+}
